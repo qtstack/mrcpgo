@@ -1,0 +1,39 @@
+# mrcpgo example configuration.
+#
+# Every key is optional; unset keys fall back to the defaults shown here.
+# Unknown keys are rejected so typos fail fast.
+
+log:
+  # debug | info | warn | error
+  level: info
+  # text | json
+  format: text
+
+sip:
+  # UDP listen address. Use port 5060 to appear as a normal SIP UAS.
+  listen: "0.0.0.0:5060"
+  # Address advertised in Contact and SDP. Leave empty to derive it from the
+  # interface used to reach the peer, which is correct on a single homed host.
+  advertise_addr: ""
+  user_agent: "mrcpgo/0.1"
+  contact_user: "mrcpgo"
+  server_name: "mrcpgo"
+
+rtp:
+  # Local address RTP sockets bind to.
+  listen_host: "0.0.0.0"
+
+mrcp:
+  # Local address MRCPv2 control listeners bind to.
+  listen_host: "0.0.0.0"
+  engine:
+    # Only "mock" is built in.
+    type: mock
+    # Simulated recognition latency of the mock recognizer.
+    recognition_delay: 200ms
+    # Number of 20 ms frames a mock SPEAK produces (50 = one second).
+    frames_per_utterance: 50
+
+http:
+  # Optional health endpoint. Empty disables it.
+  listen: ""

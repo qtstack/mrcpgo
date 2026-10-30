@@ -1,0 +1,7 @@
+MRCP/2.0 171 RECOGNITION-COMPLETE 7 COMPLETE
+Channel-Identifier: a@speechrecog
+Content-Type: application/nlsml+xml
+Content-Length: 31
+
+<?xml version="1.0"?>
+<result/>

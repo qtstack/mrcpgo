@@ -1,0 +1,5 @@
+# Normalise text files to LF, but keep MRCP wire fixtures byte exact: they are
+# framed with CRLF and contain a bare LF inside the NLSML payload (which is why
+# they must not be line-ending normalised).
+* text=auto eol=lf
+testdata/mrcp_*.txt -text

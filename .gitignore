@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+coverage.txt
+
+# IDE directories
+.idea/
+.vscode/
