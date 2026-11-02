@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/qtstack/mrcpgo/internal/config"
-	"github.com/qtstack/mrcpgo/internal/engine/mock"
+	"github.com/qtstack/mrcpgo/internal/engine"
 	"github.com/qtstack/mrcpgo/internal/server"
 )
 
@@ -43,9 +43,10 @@ func run() error {
 	}
 	slog.SetDefault(log)
 
-	engines := mock.NewFactory()
-	engines.RecognitionDelay = cfg.MRCP.Engine.RecognitionDelay.Value()
-	engines.FramesPerUtterance = cfg.MRCP.Engine.FramesPerUtterance
+	engines, err := engine.New(cfg, log)
+	if err != nil {
+		return err
+	}
 
 	srv, err := server.New(cfg, log, engines)
 	if err != nil {

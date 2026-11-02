@@ -27,12 +27,141 @@ mrcp:
   # Local address MRCPv2 control listeners bind to.
   listen_host: "0.0.0.0"
   engine:
-    # Only "mock" is built in.
+    # Engine implementation: mock | alicloud | tencent | xfyun.
     type: mock
+
+    # --- mock engine ---
     # Simulated recognition latency of the mock recognizer.
     recognition_delay: 200ms
     # Number of 20 ms frames a mock SPEAK produces (50 = one second).
     frames_per_utterance: 50
+
+    # --- Alibaba Cloud Intelligent Speech Interaction (NLS) ---
+    # Select it with "type: alicloud". Secrets should be supplied through the
+    # environment, for example access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}.
+    alicloud:
+      # Project appkey from the Intelligent Speech console.
+      app_key: ""
+      # AccessKey pair used to obtain a short lived NLS token. Not needed when
+      # token is set.
+      access_key_id: ""
+      access_key_secret: ""
+      # Pre-obtained NLS token. When set, no CreateToken request is made.
+      token: ""
+      region: cn-shanghai
+      # Optional endpoint overrides. Empty values derive the defaults:
+      # endpoint:       wss://nls-gateway.<region>.aliyuncs.com/ws/v1
+      # token_endpoint: https://nls-meta.<region>.aliyuncs.com
+      endpoint: ""
+      token_endpoint: ""
+      # Refresh a cached token this long before it expires (tokens last ~24h).
+      token_refresh_before: 5m
+      # Connection and control-write timeout.
+      timeout: 5s
+
+      asr:
+        # Only pcm is supported. 8 kHz matches telephony audio and avoids
+        # resampling; 16 kHz input is upsampled from the same stream.
+        format: pcm
+        sample_rate: 8000
+        enable_intermediate_result: false
+        enable_punctuation_prediction: true
+        enable_inverse_text_normalization: true
+        # Audio buffered per upstream frame.
+        chunk_ms: 100
+        # Extra fields merged into the StartRecognition payload, for example:
+        #   max_sentence_silence: 800
+        #   vocabulary_id: "..."
+        #   customization_id: "..."
+        params: {}
+
+      tts:
+        voice: xiaoyun
+        # Only pcm is supported. 16 kHz output is downsampled to 8 kHz before
+        # mu-law encoding; set 8000 to ask for narrowband directly.
+        format: pcm
+        sample_rate: 16000
+        volume: 50        # 0-100
+        speech_rate: 0    # -500..500
+        pitch_rate: 0     # -500..500
+        long_text: false
+        # Extra fields merged into the StartSynthesis payload.
+        params: {}
+
+    # --- Tencent Cloud speech: real-time ASR v2 + streaming TTS ---
+    # Select it with "type: tencent".
+    tencent:
+      # Numeric AppId written as a string.
+      app_id: ""
+      secret_id: ""
+      secret_key: ""
+      # Optional endpoint overrides. Empty values derive:
+      #   asr_endpoint: wss://asr.cloud.tencent.com/asr/v2/<app_id>
+      #   tts_endpoint: wss://tts.cloud.tencent.com/stream_wsv2
+      asr_endpoint: ""
+      tts_endpoint: ""
+      timeout: 5s
+
+      asr:
+        engine_model_type: 16k_zh
+        # PCM rate sent upstream: 8000 or 16000. 8 kHz telephony audio is
+        # upsampled when 16000 is selected (pair 8k_zh with 8000 if preferred).
+        sample_rate: 16000
+        need_vad: true
+        # Silence in milliseconds that closes a sentence. 0 = service default.
+        vad_silence_time: 0
+        convert_num_mode: 1
+        chunk_ms: 100
+        # Extra query parameters, for example:
+        #   hotword_id: "..."
+        #   customization_id: "..."
+        #   hotword_list: "语音助理|10,ASR|11"
+        params: {}
+
+      tts:
+        # Tencent voice id; 0 uses the service default.
+        voice_type: 0
+        # 8000 or 16000. 16 kHz output is downsampled to 8 kHz before mu-law
+        # encoding.
+        sample_rate: 16000
+        speed: 0            # -2..6
+        volume: 0           # -10..10
+        emotion_category: ""
+        emotion_intensity: 0  # 50..200, requires emotion_category
+        segment_rate: 0       # 0..2
+        params: {}
+
+    # --- iFlytek (讯飞) speech: real-time transcription + online TTS ---
+    # Select it with "type: xfyun".
+    xfyun:
+      app_id: ""
+      api_key: ""
+      api_secret: ""
+      # Optional endpoint overrides. Empty values derive:
+      #   asr_endpoint: wss://rtasr.xfyun.cn/v1/ws
+      #   tts_endpoint: wss://tts-api.xfyun.cn/v2/tts
+      asr_endpoint: ""
+      tts_endpoint: ""
+      timeout: 5s
+
+      asr:
+        # rtasr only accepts 16 kHz; 8 kHz telephony audio is upsampled.
+        sample_rate: 16000
+        lang: cn
+        # The service recommends 40 ms (1280 bytes at 16 kHz) per frame.
+        chunk_ms: 40
+        # Extra query parameters, for example pd or transType.
+        params: {}
+
+      tts:
+        voice: xiaoyan
+        # 8000 or 16000; 16 kHz output is downsampled before mu-law encoding.
+        sample_rate: 16000
+        speed: 50     # 0..100
+        volume: 50    # 0..100
+        pitch: 50     # 0..100
+        # Extra business parameters, for example bgs, reg or rdn.
+        params: {}
 
 http:
   # Optional health endpoint. Empty disables it.

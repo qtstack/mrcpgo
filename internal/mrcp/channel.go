@@ -31,12 +31,10 @@ const (
 
 // Content types understood by this implementation.
 const (
-	ContentTypeNLSML       = "application/nlsml+xml"
-	ContentTypeSRGS        = "application/srgs+xml"
-	ContentTypeURIList     = "text/uri-list"
-	ContentTypeSSML        = "application/ssml+xml"
-	completionCauseOK      = "000 success"
-	completionCauseNoInput = "002 no-input"
+	ContentTypeNLSML   = "application/nlsml+xml"
+	ContentTypeSRGS    = "application/srgs+xml"
+	ContentTypeURIList = "text/uri-list"
+	ContentTypeSSML    = "application/ssml+xml"
 )
 
 // FrameSender sends one G.711 mu-law frame to the RTP peer. It is implemented
@@ -373,16 +371,21 @@ func (c *Channel) recognitionLoop(ctx context.Context, reqID uint32, results <-c
 				c.clearActive(reqID)
 				return
 			}
-			if res.Err != nil {
-				c.finishIfActive(reqID, func() {
-					c.sendEventWithCause(reqID, EventRecognitionComplete, completionCauseNoInput, "", nil)
-				})
-			} else {
-				c.finishIfActive(reqID, func() {
-					c.sendEventWithCause(reqID, EventRecognitionComplete, completionCauseOK,
-						ContentTypeNLSML, res.NLSML)
-				})
+			cause := res.CompletionCause
+			if cause == "" {
+				if res.Err != nil {
+					cause = model.CauseNoInput
+				} else {
+					cause = model.CauseSuccess
+				}
 			}
+			contentType := ""
+			if len(res.NLSML) > 0 {
+				contentType = ContentTypeNLSML
+			}
+			c.finishIfActive(reqID, func() {
+				c.sendEventWithCause(reqID, EventRecognitionComplete, cause, contentType, res.NLSML)
+			})
 			return
 		}
 	}
@@ -458,13 +461,13 @@ func (c *Channel) speechLoop(ctx context.Context, reqID uint32, stream io.ReadCl
 			continue
 		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			c.finishIfActive(reqID, func() {
-				c.sendEventWithCause(reqID, EventSpeakComplete, completionCauseOK, "", nil)
+				c.sendEventWithCause(reqID, EventSpeakComplete, model.CauseSuccess, "", nil)
 			})
 			return
 		default:
 			c.log.Error("synthesis stream failed", "error", err, "request_id", reqID)
 			c.finishIfActive(reqID, func() {
-				c.sendEventWithCause(reqID, EventSpeakComplete, completionCauseNoInput, "", nil)
+				c.sendEventWithCause(reqID, EventSpeakComplete, model.CauseNoInput, "", nil)
 			})
 			return
 		}
@@ -480,8 +483,10 @@ func (c *Channel) handleStop(msg *Message) {
 
 	if active != nil {
 		active.cancel()
-		c.stopEngine(active.method)
 		c.log.Info("request stopped", "request_id", active.id, "mrcp_method", active.method)
+		// Engine teardown may involve a network round trip to the speech
+		// service; answer the STOP first and abort in the background.
+		c.goTracked(func() { c.stopEngine(active.method) })
 	}
 	c.respond(msg, StatusSuccess, StateComplete)
 }

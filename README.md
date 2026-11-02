@@ -9,7 +9,10 @@ protocol implementation.
 
 The speech engines are pluggable. A deterministic mock engine ships with the
 server so the whole call path can be exercised end to end without an ASR or TTS
-backend.
+backend. Three cloud engines provide real recognition and synthesis over their
+native WebSocket protocols: **Alibaba Cloud Intelligent Speech (NLS)**,
+**Tencent Cloud** (real-time recognition v2 and streaming synthesis) and
+**iFlytek** (real-time transcription and online synthesis).
 
 ---
 
@@ -19,6 +22,7 @@ backend.
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
+- [Speech engines](#speech-engines)
 - [FreeSWITCH `mod_unimrcp` integration](#freeswitch-mod_unimrcp-integration)
 - [Architecture](#architecture)
 - [Protocol behaviour](#protocol-behaviour)
@@ -38,12 +42,12 @@ backend.
 | MRCPv2 | Length-prefixed codec; `SET-PARAMS`, `GET-PARAMS`, `DEFINE-GRAMMAR`, `RECOGNIZE`, `START-INPUT-TIMERS`, `STOP`, `SPEAK`; events `START-OF-INPUT`, `RECOGNITION-COMPLETE`, `SPEAK-COMPLETE` |
 | RTP | UDP + `pion/rtp`, G.711 mu-law (PT 0), 20 ms frames from a 20 ms ticker, sequence/timestamp/SSRC maintenance, loss and reordering counters |
 | Sessions | One SIP dialog per session, deterministic teardown on BYE, control-channel disconnect and process shutdown |
-| Engines | `Recognizer` / `Synthesizer` interfaces with a mock implementation |
-| Ops | Structured `slog` logging, optional `/healthz` endpoint, YAML configuration |
+| Engines | `Recognizer` / `Synthesizer` interfaces; deterministic mock engine, Alibaba Cloud NLS engine, Tencent Cloud engine (ASR v2 + streaming TTS), iFlytek engine (rtasr + online TTS) |
+| Ops | Structured `slog` logging, optional `/healthz` endpoint, YAML configuration with `${ENV}` secret expansion |
 
 Out of scope by design: SIP registration, digest authentication, proxying,
-TLS/SRTP/DTLS, SCTP, recorder and speaker-verification resources, real ASR/TTS
-inference, VAD, jitter buffering and RTCP.
+TLS/SRTP/DTLS, SCTP, recorder and speaker-verification resources, VAD based
+`START-OF-INPUT`, jitter buffering and RTCP.
 
 ## Requirements
 
@@ -57,6 +61,7 @@ Direct dependencies, pinned in `go.mod`:
 |---|---|---|
 | `github.com/emiago/sipgo` | `v1.6.0` | SIP transport, transactions and dialogs |
 | `github.com/pion/rtp` | `v1.10.6` | RTP packet marshal/unmarshal |
+| `github.com/gorilla/websocket` | `v1.5.3` | Alibaba Cloud NLS WebSocket transport |
 | `gopkg.in/yaml.v3` | `v3.0.1` | Configuration parsing |
 
 ## Quick start
@@ -113,9 +118,10 @@ rtp:
 mrcp:
   listen_host: "0.0.0.0"
   engine:
-    type: mock
+    type: mock            # mock | alicloud
     recognition_delay: 200ms
     frames_per_utterance: 50
+    # See the Speech engines section for the alicloud block.
 
 http:
   listen: ""
@@ -123,6 +129,249 @@ http:
 
 Only the SIP listener is fixed; the RTP UDP port and every MRCP TCP port are
 allocated per call (`:0`) and advertised in the SDP answer.
+
+Values may reference the environment with `${NAME}` so credentials stay out of
+the file:
+
+```yaml
+sip:
+  # ...
+mrcp:
+  engine:
+    type: alicloud
+    alicloud:
+      access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}
+```
+
+Unresolved references are left as-is and fail validation with a clear message.
+
+## Speech engines
+
+### mock
+
+Deterministic engine used by the tests and for wiring-free experiments. It
+returns a fixed NLSML document and produces one second of mu-law silence per
+SPEAK.
+
+### Alibaba Cloud Intelligent Speech Interaction (NLS)
+
+Select it with `mrcp.engine.type: alicloud`. Recognition and synthesis use the
+NLS WebSocket protocol: JSON control frames carrying `header`/`payload` and raw
+binary PCM audio frames, with the same message names as the official SDK
+(`StartRecognition`, `RecognitionStarted`, `RecognitionResultChanged`,
+`RecognitionCompleted`, `StartSynthesis`, `MetaInfo`, `SynthesisCompleted`,
+`TaskFailed`).
+
+```yaml
+mrcp:
+  engine:
+    type: alicloud
+    alicloud:
+      app_key: ""                              # console appkey
+      access_key_id: ${ALIYUN_ACCESS_KEY_ID}
+      access_key_secret: ${ALIYUN_ACCESS_KEY_SECRET}
+      token: ""                                # optional static token
+      region: cn-shanghai
+      endpoint: ""                             # default wss://nls-gateway.<region>.aliyuncs.com/ws/v1
+      token_endpoint: ""                       # default https://nls-meta.<region>.aliyuncs.com
+      token_refresh_before: 5m
+      timeout: 5s
+      asr:
+        format: pcm                            # only pcm
+        sample_rate: 8000                      # 8000 or 16000
+        enable_intermediate_result: false
+        enable_punctuation_prediction: true
+        enable_inverse_text_normalization: true
+        chunk_ms: 100
+        params: {}                             # merged into StartRecognition
+      tts:
+        voice: xiaoyun
+        format: pcm                            # only pcm
+        sample_rate: 16000                     # 8000 or 16000
+        volume: 50
+        speech_rate: 0
+        pitch_rate: 0
+        long_text: false
+        params: {}                             # merged into StartSynthesis
+```
+
+How the bridge works:
+
+- **Tokens.** With `token` unset, the server calls `CreateToken` on the NLS meta
+  API using the AccessKey pair, signs the request with the Alibaba Cloud RPC
+  HMAC-SHA1 scheme, and caches the result until `token_refresh_before` before
+  expiry. A failed refresh keeps using the previous token while it is still
+  valid. One token source is shared by every channel.
+- **Recognition.** `RECOGNIZE` opens one WebSocket per request, sends
+  `StartRecognition`, then streams binary PCM. Inbound 20 ms mu-law RTP frames
+  are decoded to 8 kHz PCM and upsampled to 16 kHz when configured; audio is
+  buffered into `chunk_ms` frames and dropped (with a counter and warning) if
+  the upstream queue is full, so the RTP loop is never blocked. Audio received
+  while no recognition is active is discarded.
+- **Results.** `RecognitionCompleted` becomes a `RECOGNITION-COMPLETE` event
+  with an NLSML body; an empty result reports Completion-Cause `001 no-match`.
+  `TaskFailed` and transport errors report the failure to the MRCP layer.
+  Intermediate results are logged at debug level.
+- **Synthesis.** `SPEAK` opens one WebSocket, sends `StartSynthesis` with the
+  text, and converts the returned PCM to 8 kHz mu-law frames. 16 kHz output is
+  downsampled by averaging sample pairs before encoding. `SynthesisCompleted`
+  becomes `SPEAK-COMPLETE`; `TaskFailed` ends the stream with an error.
+- **Cancellation.** MRCP `STOP`, BYE and shutdown cancel the request context,
+  send `StopRecognition` best effort, and close the socket so the service stops
+  billing immediately.
+- **Grammar URIs.** Cloud recognition has no SRGS concept. The grammar URI is
+  logged and ignored; model or domain selection belongs in
+  `alicloud.asr.params` (for example `vocabulary_id`, `customization_id` or
+  `max_sentence_silence`).
+
+A note on `START-OF-INPUT`: like the mock engine, the Alibaba adapter is driven
+by the channel, which reports `START-OF-INPUT` when recognition begins. The NLS
+real-time protocol has no speech-onset event, and adding local VAD is future
+work.
+
+### Tencent Cloud
+
+Select it with `mrcp.engine.type: tencent`. The engine speaks two Tencent Cloud
+WebSocket APIs directly:
+
+- **Real-time speech recognition v2**:
+  `wss://asr.cloud.tencent.com/asr/v2/<app_id>`, HMAC-SHA1 signed query
+  parameters, binary PCM frames, JSON results carrying
+  `sentences.sentence_list`.
+- **Streaming text-to-speech v2**:
+  `wss://tts.cloud.tencent.com/stream_wsv2` with
+  `Action=TextToStreamAudioWSv2`: wait for `READY`, send `ACTION_SYNTHESIS` and
+  `ACTION_COMPLETE`, receive binary PCM, finish on `FINAL`.
+
+```yaml
+mrcp:
+  engine:
+    type: tencent
+    tencent:
+      app_id: ""                               # numeric AppId, quoted
+      secret_id: ${TENCENT_SECRET_ID}
+      secret_key: ${TENCENT_SECRET_KEY}
+      asr_endpoint: ""                         # default wss://asr.cloud.tencent.com/asr/v2/<app_id>
+      tts_endpoint: ""                         # default wss://tts.cloud.tencent.com/stream_wsv2
+      timeout: 5s
+      asr:
+        engine_model_type: 16k_zh
+        sample_rate: 16000                     # 8000 or 16000
+        need_vad: true
+        vad_silence_time: 0                    # ms, 0 = service default
+        convert_num_mode: 1
+        chunk_ms: 100
+        params: {}                             # hotword_id, customization_id, hotword_list, ...
+      tts:
+        voice_type: 0
+        sample_rate: 16000                     # 8000 or 16000
+        speed: 0                               # -2..6
+        volume: 0                              # -10..10
+        emotion_category: ""
+        emotion_intensity: 0                   # 50..200, needs a category
+        segment_rate: 0                        # 0..2
+        params: {}
+```
+
+How the bridge works:
+
+- **Signing.** The two APIs use different signature inputs: ASR signs
+  `<host><path>?<sorted query>`, TTS signs
+  `GET<host><path>?<sorted query>`. Both are HMAC-SHA1 and Base64 encoded,
+  implemented locally and checked against golden vectors in the tests. The
+  official Tencent speech SDK is not imported: it pins `gorilla/websocket
+  v1.4.2` and `google/uuid`, which this project already avoids.
+- **Recognition handshake.** `Start` reads the handshake synchronously, so a bad
+  signature or parameter surfaces as a failed `RECOGNIZE` (500) instead of a
+  late event.
+- **Recognition completion.** Tencent v2 reports sentence state with
+  `sentence_type` (0 uncertain, 1 definite). The first definite sentence
+  completes the request: one MRCP `RECOGNIZE` maps to one utterance, which is
+  what `mod_unimrcp` expects. `final=1` with no text reports `001 no-match`.
+  The v2 API does not return a confidence score, so the NLSML `confidence`
+  attribute is omitted rather than fabricated. Completion relies on server side
+  VAD, so keep `need_vad: true` unless the client always sends `STOP`.
+- **Model and sample rate.** `sample_rate` is the PCM rate sent upstream and
+  `engine_model_type` is the recognition model. Pair `8k_zh` with `8000`, or
+  keep the default `16k_zh` with `16000` (telephony audio is upsampled). When
+  sending 8 kHz PCM to a 16 kHz engine, add
+  `params: { input_sample_rate: "8000" }` to let the service upsample instead.
+- **Speech onset.** `sentence_type=0` is Tencent's "speech detected" signal, but
+  it is only logged for now; like the other engines, `START-OF-INPUT` is sent
+  when recognition starts.
+- **Synthesis.** The adapter waits for `READY`, submits the whole text followed
+  by `ACTION_COMPLETE`, and converts the returned PCM to 8 kHz mu-law
+  (downsampling by averaging sample pairs when configured for 16 kHz). `FINAL`
+  ends the stream.
+- **Cancellation.** `STOP`, BYE and shutdown cancel the context and close the
+  socket; recognition also sends a best effort `{"type":"end"}` frame.
+
+Only the streaming-text v2 synthesis API is used. The basic HTTP `TextToVoice`
+API (150 character limit, non-streaming response) and the older
+`TextToStreamAudioWS` endpoint do not fit MRCP `SPEAK` as well and are not
+implemented.
+
+### iFlytek (讯飞)
+
+Select it with `mrcp.engine.type: xfyun`. Two WebSocket APIs are used:
+
+- **Real-time transcription (rtasr)**: `wss://rtasr.xfyun.cn/v1/ws` signed with
+  `signa = Base64(HMAC-SHA1(MD5(app_id + ts), api_key))`, 16 kHz PCM in 40 ms
+  frames, and JSON results whose `data` field is a nested JSON string holding
+  `cn.st.rt[].ws[].cw[].w` words and `st.type` (`0` final, `1` interim).
+- **Online speech synthesis**: `wss://tts-api.xfyun.cn/v2/tts` with the
+  HMAC-SHA256 `authorization` handshake, one JSON frame
+  (`common`/`business`/`data`) carrying base64 text, and base64 PCM in
+  `data.audio` until `data.status == 2`.
+
+```yaml
+mrcp:
+  engine:
+    type: xfyun
+    xfyun:
+      app_id: ""
+      api_key: ${XFYUN_API_KEY}
+      api_secret: ${XFYUN_API_SECRET}
+      asr_endpoint: ""                         # default wss://rtasr.xfyun.cn/v1/ws
+      tts_endpoint: ""                         # default wss://tts-api.xfyun.cn/v2/tts
+      timeout: 5s
+      asr:
+        sample_rate: 16000                     # rtasr requires 16 kHz
+        lang: cn
+        chunk_ms: 40                           # 1280 bytes at 16 kHz
+        params: {}                             # pd, transType, ...
+      tts:
+        voice: xiaoyan                         # vcn
+        sample_rate: 16000                     # 8000 or 16000
+        speed: 50                              # 0..100
+        volume: 50                             # 0..100
+        pitch: 50                              # 0..100
+        params: {}                             # bgs, reg, rdn, ...
+```
+
+How the bridge works:
+
+- **Signing.** The rtasr `signa` and the TTS `authorization` handshake are
+  implemented locally and checked against golden vectors: the documented
+  iFlytek `signa` example, and an independently computed HMAC-SHA256 value for
+  the synthesis signature.
+- **Recognition.** The `started` handshake is read synchronously so a bad
+  signature fails the `RECOGNIZE` instead of producing a late event. Inbound
+  20 ms mu-law RTP frames are decoded to PCM and upsampled to 16 kHz; audio is
+  buffered into `chunk_ms` frames (40 ms / 1280 bytes by default) and dropped
+  with a counter if the upstream queue is full. The first final segment
+  (`st.type == "0"`) completes the request, one utterance per `RECOGNIZE`.
+  Interim segments are logged at debug level.
+- **Synthesis.** The whole text is sent as a single final frame
+  (`data.status = 2`) with `aue=raw` and `auf=audio/L16;rate=<sample_rate>`.
+  Base64 audio is decoded, converted to 8 kHz mu-law (downsampling 16 kHz by
+  averaging sample pairs) and streamed to the RTP sender. `data.status == 2`
+  ends the stream.
+- **Cancellation.** `STOP`, BYE and shutdown cancel the context and close the
+  socket; transcription also sends the binary `{"end": true}` marker best
+  effort.
+- **Confidence.** rtasr does not report a confidence score, so the NLSML
+  `confidence` attribute is omitted.
 
 ## FreeSWITCH `mod_unimrcp` integration
 
@@ -207,7 +456,14 @@ internal/session                aggregate root: lifecycle and resource release
     ├── internal/sdp            offer parsing and answer generation
     ├── internal/mrcp           MRCPv2 codec, channel state machine, dispatch
     ├── internal/media          RTP transceiver (UDP, PCMU)
-    └── internal/engine/mock    mock speech engines
+    └── internal/engine         engine selection and implementations
+        ├── mock                deterministic mock engines
+        ├── alicloud            Alibaba Cloud NLS WebSocket engine
+        ├── tencent             Tencent Cloud ASR v2 and streaming TTS
+        └── xfyun               iFlytek rtasr and online TTS
+internal/audio                  G.711, resampling and chunking helpers
+internal/nlsml                  NLSML document builder
+internal/wsutil                 serialised WebSocket writer
 internal/model                  pure data types and engine interfaces
 internal/config                 YAML configuration and logging setup
 internal/syncx                  bounded wait-group helper
@@ -291,8 +547,56 @@ a sipgo UAC (INVITE → 200 OK → ACK → RECOGNIZE/SPEAK over the MRCPv2 contr
 channel → BYE), verifies that RTP frames arrive, that every port is released and
 that `pprof.Lookup("goroutineleak")` reports no leaked goroutines.
 
+`TestCallWithAliCloudEngine` repeats the call with the Alibaba engine pointed at
+a fake NLS WebSocket server, covering token handling, the recognition control
+frame exchange, audio forwarding and the synthesis stream without cloud
+credentials. `TestCallWithTencentEngine` and `TestCallWithXfyunEngine` do the
+same for the Tencent and iFlytek engines against fake provider endpoints.
+
+Engine unit tests use `httptest` servers that speak the provider WebSocket
+protocols, so protocol regressions are caught without network access. All
+signature implementations are checked against golden vectors: the Alibaba Cloud
+RPC example, the iFlytek `signa` example, and independently computed HMAC-SHA1
+/ HMAC-SHA256 values for the Tencent ASR, Tencent TTS and iFlytek TTS
+constructions.
+
 `testdata/mrcp_*.txt` are wire-format golden files with CRLF line endings;
 `.gitattributes` pins their line endings so the round-trip test is stable.
+
+### Live cloud checks
+
+Alibaba Cloud:
+
+```bash
+export ALIYUN_ACCESS_KEY_ID=...
+export ALIYUN_ACCESS_KEY_SECRET=...
+export ALIYUN_NLS_APP_KEY=...
+# edit a copy of config.example.yaml: type: alicloud, app_key: ${ALIYUN_NLS_APP_KEY}
+go run ./cmd/mrcpgo -config alicloud.yaml
+```
+
+Tencent Cloud:
+
+```bash
+export TENCENT_SECRET_ID=...
+export TENCENT_SECRET_KEY=...
+# edit a copy of config.example.yaml: type: tencent and app_id: "<your appid>"
+go run ./cmd/mrcpgo -config tencent.yaml
+```
+
+iFlytek:
+
+```bash
+export XFYUN_API_KEY=...
+export XFYUN_API_SECRET=...
+# edit a copy of config.example.yaml: type: xfyun and app_id: "<your appid>"
+go run ./cmd/mrcpgo -config xfyun.yaml
+```
+
+Then place a call with `fs_cli` and watch for `NLS token obtained`,
+`NLS recognition completed`, `NLS synthesis completed`, `Tencent recognition
+completed`, `Tencent synthesis completed`, `iFlytek transcription completed` or
+`iFlytek synthesis completed` in the log.
 
 ## Implementation notes and deviations
 
@@ -352,6 +656,25 @@ All non-obvious choices are marked `// DECISION:` in the source. Summary:
 - Inbound RTP payloads are offered to recognizers through the optional
   `model.AudioConsumer` interface; engines that do not implement it are valid
   (the mock ignores audio).
+- The Alibaba engine implements the NLS protocol directly over
+  `gorilla/websocket` instead of importing `alibabacloud-nls-go-sdk`. The
+  official Go SDK has not been released since 2023, pins
+  `gorilla/websocket v1.4.2` and the archived `satori/go.uuid`, and drags in the
+  full `alibaba-cloud-sdk-go`. Speaking the protocol directly keeps the
+  dependency surface to one module and gives exact control over per-request
+  connection lifetimes and cancellation.
+- The Tencent engine does the same instead of importing
+  `tencentcloud-speech-sdk-go`, which also pins `gorilla/websocket v1.4.2` and
+  `google/uuid`. Both Tencent signature schemes (ASR and TTS) are implemented
+  locally with golden-vector tests.
+- The iFlytek engine implements rtasr and the online synthesis handshake
+  directly; the two auth schemes (`signa` for ASR, HMAC-SHA256
+  `authorization` for TTS) are local code with golden-vector tests.
+- `CreateToken` is implemented locally (RPC HMAC-SHA1 signature, verified
+  against the documented example vector) with a single shared token cache,
+  instead of pulling an OpenAPI SDK for one call.
+- Upstream audio is queued with a bounded buffer and dropped with a counter when
+  full, so a slow cloud connection can never stall the RTP receive loop.
 - RTP starts with a random SSRC, sequence number and timestamp (RFC 3550).
 - Sessions wait for goroutines with a 5 second bound (`internal/syncx`) so a
   misbehaving engine cannot hang shutdown forever.
@@ -360,8 +683,21 @@ All non-obvious choices are marked `// DECISION:` in the source. Summary:
 
 - UDP SIP only; no TCP/TLS transport, no RFC 3261 authentication, no re-INVITE.
 - No RTCP, jitter buffer or packet reordering.
-- Speech engines are mocks; the engine interface is the integration point for a
-  real ASR/TTS backend.
+- Only the mock, Alibaba Cloud, Tencent Cloud and iFlytek engines are built in;
+  other providers need their own `model.Recognizer` / `model.Synthesizer`
+  implementation.
+- The Alibaba engine supports PCM at 8 kHz and 16 kHz only. It does not use
+  SRGS grammars (`DEFINE-GRAMMAR` is accepted but the URI is ignored) and does
+  not report speech onset, so `START-OF-INPUT` is sent when recognition starts
+  rather than when speech is detected.
+- The Tencent engine completes a `RECOGNIZE` on the first definite sentence,
+  which models a single utterance per request; long multi-sentence dictation
+  would need a different completion policy. It uses the streaming TTS v2 API
+  only and reports no confidence score.
+- The iFlytek engine accepts only 16 kHz PCM (8 kHz audio is upsampled), also
+  completes on the first final segment, and reports no confidence score.
+- Recognition is one request per cloud connection; there is no reconnection or
+  retry in the middle of an utterance.
 
 ## License
 

@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/emiago/sipgo v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/pion/rtp v1.10.6
 	gopkg.in/yaml.v3 v3.0.1
 )

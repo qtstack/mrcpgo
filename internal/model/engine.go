@@ -5,6 +5,14 @@ import (
 	"io"
 )
 
+// Completion causes reported in RECOGNITION-COMPLETE and SPEAK-COMPLETE events
+// (RFC 6787 appendix A.1).
+const (
+	CauseSuccess = "000 success"
+	CauseNoMatch = "001 no-match"
+	CauseNoInput = "002 no-input"
+)
+
 // RecognizerResult carries the outcome of a single recognition request.
 type RecognizerResult struct {
 	// NLSML is the raw NLSML document reported in the RECOGNITION-COMPLETE
@@ -13,6 +21,10 @@ type RecognizerResult struct {
 	// Err reports a recognition failure. A non-nil Err is surfaced to the
 	// client as a RECOGNITION-COMPLETE event with a Completion-Cause header.
 	Err error
+	// CompletionCause overrides the Completion-Cause header value. When empty
+	// the channel reports CauseSuccess, or CauseNoInput for a non-nil Err.
+	// Engines use it to report CauseNoMatch for an empty recognition.
+	CompletionCause string
 }
 
 // Recognizer is the speech recognition engine contract.
